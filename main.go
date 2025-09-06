@@ -168,6 +168,18 @@ func (s *MDNSServer) listen(iface *net.Interface, addr *net.UDPAddr) {
 	}
 }
 
+func (s *MDNSServer) AddDomain(domain string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.domains[domain] = struct{}{}
+}
+
+func (s *MDNSServer) RemoveDomain(domain string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.domains, domain)
+}
+
 func (s *MDNSServer) Stop() {
 	s.shutdown.Store(true)
 	s.wg.Wait()
