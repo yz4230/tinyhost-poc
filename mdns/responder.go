@@ -17,15 +17,15 @@ import (
 var ipv4Addr = &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
 var ipv6Addr = &net.UDPAddr{IP: net.ParseIP("ff02::fb"), Port: 5353}
 
-type Server struct {
+type Responder struct {
 	shutdown *atomic.Bool
 	mu       *sync.RWMutex
 	wg       *sync.WaitGroup
 	domains  map[string]struct{}
 }
 
-func NewServer(domains []string) *Server {
-	return &Server{
+func NewResponder(domains []string) *Responder {
+	return &Responder{
 		shutdown: &atomic.Bool{},
 		mu:       &sync.RWMutex{},
 		wg:       &sync.WaitGroup{},
@@ -33,7 +33,7 @@ func NewServer(domains []string) *Server {
 	}
 }
 
-func (s *Server) Start() error {
+func (s *Responder) Start() error {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return fmt.Errorf("failed to get network interfaces: %w", err)
@@ -50,7 +50,7 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) listen(iface *net.Interface, addr *net.UDPAddr) {
+func (s *Responder) listen(iface *net.Interface, addr *net.UDPAddr) {
 	var ipNets []*net.IPNet
 	if addrs, err := iface.Addrs(); err == nil {
 		for _, addr := range addrs {
@@ -111,7 +111,7 @@ func (s *Server) listen(iface *net.Interface, addr *net.UDPAddr) {
 	}
 }
 
-func (s *Server) reply(
+func (s *Responder) reply(
 	conn *net.UDPConn,
 	addr *net.UDPAddr,
 	msg *dnsmessage.Message,
@@ -172,19 +172,19 @@ func (s *Server) reply(
 	return false
 }
 
-func (s *Server) AddDomain(domain string) {
+func (s *Responder) AddDomain(domain string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.domains[domain] = struct{}{}
 }
 
-func (s *Server) RemoveDomain(domain string) {
+func (s *Responder) RemoveDomain(domain string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.domains, domain)
 }
 
-func (s *Server) Stop() {
+func (s *Responder) Stop() {
 	s.shutdown.Store(true)
 	s.wg.Wait()
 }

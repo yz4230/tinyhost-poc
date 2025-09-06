@@ -12,11 +12,11 @@ import (
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 
-	server := mdns.NewServer([]string{"hello.local."})
-	if err := server.Start(); err != nil {
+	responder := mdns.NewResponder([]string{"hello.local."})
+	if err := responder.Start(); err != nil {
 		panic(err)
 	}
-	defer server.Stop()
+	defer responder.Stop()
 
 	chSignal := make(chan os.Signal, 1)
 	signal.Notify(chSignal, os.Interrupt)
