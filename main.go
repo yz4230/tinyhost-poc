@@ -1,71 +1,125 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"github.com/samber/lo"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
+var ipv4Addr = &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
+var ipv6Addr = &net.UDPAddr{IP: net.ParseIP("ff02::fb"), Port: 5353}
+
 func main() {
-	ipv4Addr := &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		log.Fatalln(err)
+	server := NewMDNSServer([]string{"hello.local."})
+	if err := server.Start(); err != nil {
+		panic(err)
 	}
+	defer server.Stop()
 
-	wg := &sync.WaitGroup{}
-	for _, iface := range ifaces {
-		log.Println(iface.Flags.String())
-
-		var ips []net.IP
-		if addrs, err := iface.Addrs(); err == nil {
-			for _, addr := range addrs {
-				log.Printf("Interface %s has address %s\n", iface.Name, addr)
-				if ipnet, ok := addr.(*net.IPNet); ok {
-					log.Printf("  IP: %s\n", ipnet.IP)
-					if ip := ipnet.IP.To4(); ip != nil {
-						ips = append(ips, ip)
-					}
-				}
-			}
-		}
-
-		conn, err := net.ListenMulticastUDP("udp4", &iface, ipv4Addr)
-		if err != nil {
-			panic(err)
-		}
-
-		wg.Go(func() { loop(conn, ips) })
-	}
-
-	wg.Wait()
+	chSignal := make(chan os.Signal, 1)
+	signal.Notify(chSignal, os.Interrupt)
+	<-chSignal
 }
 
-func loop(conn *net.UDPConn, ips []net.IP) {
-	buf := make([]byte, 512)
-	for {
-		n, addr, err := conn.ReadFromUDP(buf)
-		if err != nil {
+type MDNSServer struct {
+	shutdown *atomic.Bool
+	mu       *sync.Mutex
+	wg       *sync.WaitGroup
+	domains  map[string]struct{}
+}
+
+func NewMDNSServer(domains []string) *MDNSServer {
+	return &MDNSServer{
+		shutdown: &atomic.Bool{},
+		mu:       &sync.Mutex{},
+		wg:       &sync.WaitGroup{},
+		domains:  lo.Keyify(domains),
+	}
+}
+
+func (s *MDNSServer) Start() error {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("failed to get network interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		if strings.HasPrefix(iface.Name, "br") || strings.HasPrefix(iface.Name, "veth") {
+			continue
+		}
+		s.wg.Go(func() { s.listen(&iface, ipv6Addr) })
+		s.wg.Go(func() { s.listen(&iface, ipv4Addr) })
+	}
+
+	return nil
+}
+
+func (s *MDNSServer) listen(iface *net.Interface, addr *net.UDPAddr) {
+	var ipNets []*net.IPNet
+	if addrs, err := iface.Addrs(); err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				ipNets = append(ipNets, ipnet)
+			}
+		}
+	}
+
+	conn, err := net.ListenMulticastUDP("udp", iface, addr)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	log.Info().Msgf("Started mDNS server on %s (%s)", iface.Name, addr)
+
+	buf := make([]byte, iface.MTU)
+	for !s.shutdown.Load() {
+		if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
 			panic(err)
 		}
+		n, src, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if os.IsTimeout(err) {
+				continue
+			}
+			panic(err)
+		}
+
+		log.Info().Msgf("Received %d bytes from %s on %s", n, src, iface.Name)
+
+		// Ignore packets not destined to one of our IPs
+		if !lo.ContainsBy(ipNets, func(ipNet *net.IPNet) bool { return ipNet.Contains(src.IP) }) {
+			continue
+		}
+
 		var msg dnsmessage.Message
 		if err := msg.Unpack(buf[:n]); err != nil {
 			panic(err)
 		}
 
 		var answers []dnsmessage.Resource
-
 		for _, q := range msg.Questions {
+			if !lo.HasKey(s.domains, q.Name.String()) {
+				continue
+			}
 			switch q.Type {
 			case dnsmessage.TypeA:
-				if !strings.HasSuffix(q.Name.String(), "local.") {
-					continue
-				}
-				log.Printf("A record query for %s from %s\n", q.Name, addr)
+				ips := lo.FilterMap(ipNets, func(ipNet *net.IPNet, _ int) (net.IP, bool) {
+					ip := ipNet.IP.To4()
+					return ip, ip != nil
+				})
 				for _, ip := range ips {
 					answers = append(answers, dnsmessage.Resource{
 						Header: dnsmessage.ResourceHeader{
@@ -75,6 +129,22 @@ func loop(conn *net.UDPConn, ips []net.IP) {
 							TTL:   120,
 						},
 						Body: &dnsmessage.AResource{A: [4]byte(ip)},
+					})
+				}
+			case dnsmessage.TypeAAAA:
+				ips := lo.FilterMap(ipNets, func(ipNet *net.IPNet, _ int) (net.IP, bool) {
+					ip := ipNet.IP.To16()
+					return ip, ip != nil && ip.To4() == nil
+				})
+				for _, ip := range ips {
+					answers = append(answers, dnsmessage.Resource{
+						Header: dnsmessage.ResourceHeader{
+							Name:  q.Name,
+							Type:  dnsmessage.TypeAAAA,
+							Class: dnsmessage.ClassINET,
+							TTL:   120,
+						},
+						Body: &dnsmessage.AAAAResource{AAAA: [16]byte(ip)},
 					})
 				}
 			}
@@ -92,6 +162,13 @@ func loop(conn *net.UDPConn, ips []net.IP) {
 			if _, err := conn.WriteToUDP(buf, addr); err != nil {
 				panic(err)
 			}
+
+			log.Info().Msgf("Responded to %s on %s", src, iface.Name)
 		}
 	}
+}
+
+func (s *MDNSServer) Stop() {
+	s.shutdown.Store(true)
+	s.wg.Wait()
 }
