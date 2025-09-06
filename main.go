@@ -35,7 +35,7 @@ func main() {
 
 type MDNSServer struct {
 	shutdown *atomic.Bool
-	mu       *sync.Mutex
+	mu       *sync.RWMutex
 	wg       *sync.WaitGroup
 	domains  map[string]struct{}
 }
@@ -43,7 +43,7 @@ type MDNSServer struct {
 func NewMDNSServer(domains []string) *MDNSServer {
 	return &MDNSServer{
 		shutdown: &atomic.Bool{},
-		mu:       &sync.Mutex{},
+		mu:       &sync.RWMutex{},
 		wg:       &sync.WaitGroup{},
 		domains:  lo.Keyify(domains),
 	}
@@ -84,6 +84,15 @@ func (s *MDNSServer) listen(iface *net.Interface, addr *net.UDPAddr) {
 
 	log.Info().Msgf("Started mDNS server on %s (%s)", iface.Name, addr)
 
+	ipv4Addrs := lo.FilterMap(ipNets, func(ipNet *net.IPNet, _ int) (net.IP, bool) {
+		ip := ipNet.IP.To4()
+		return ip, ip != nil
+	})
+	ipv6Addrs := lo.FilterMap(ipNets, func(ipNet *net.IPNet, _ int) (net.IP, bool) {
+		ip := ipNet.IP.To16()
+		return ip, ip != nil && ip.To4() == nil
+	})
+
 	buf := make([]byte, iface.MTU)
 	for !s.shutdown.Load() {
 		if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
@@ -97,8 +106,6 @@ func (s *MDNSServer) listen(iface *net.Interface, addr *net.UDPAddr) {
 			panic(err)
 		}
 
-		log.Info().Msgf("Received %d bytes from %s on %s", n, src, iface.Name)
-
 		// Ignore packets not destined to one of our IPs
 		if !lo.ContainsBy(ipNets, func(ipNet *net.IPNet) bool { return ipNet.Contains(src.IP) }) {
 			continue
@@ -109,61 +116,62 @@ func (s *MDNSServer) listen(iface *net.Interface, addr *net.UDPAddr) {
 			panic(err)
 		}
 
-		var answers []dnsmessage.Resource
-		for _, q := range msg.Questions {
-			if !lo.HasKey(s.domains, q.Name.String()) {
-				continue
+		s.wg.Go(func() {
+			s.reply(conn, addr, &msg, ipv4Addrs, ipv6Addrs)
+			queries := lo.Map(msg.Questions, func(q dnsmessage.Question, _ int) string { return q.Name.String() })
+			log.Info().Msgf("Replied to %s for %s", src, strings.Join(queries, ", "))
+		})
+	}
+}
+
+func (s *MDNSServer) reply(conn *net.UDPConn, addr *net.UDPAddr, msg *dnsmessage.Message, ipv4Addrs, ipv6Addrs []net.IP) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var answers []dnsmessage.Resource
+	for _, q := range msg.Questions {
+		if !lo.HasKey(s.domains, q.Name.String()) {
+			continue
+		}
+		switch q.Type {
+		case dnsmessage.TypeA:
+			for _, ip := range ipv4Addrs {
+				answers = append(answers, dnsmessage.Resource{
+					Header: dnsmessage.ResourceHeader{
+						Name:  q.Name,
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+						TTL:   120,
+					},
+					Body: &dnsmessage.AResource{A: [4]byte(ip)},
+				})
 			}
-			switch q.Type {
-			case dnsmessage.TypeA:
-				ips := lo.FilterMap(ipNets, func(ipNet *net.IPNet, _ int) (net.IP, bool) {
-					ip := ipNet.IP.To4()
-					return ip, ip != nil
+		case dnsmessage.TypeAAAA:
+			for _, ip := range ipv6Addrs {
+				answers = append(answers, dnsmessage.Resource{
+					Header: dnsmessage.ResourceHeader{
+						Name:  q.Name,
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+						TTL:   120,
+					},
+					Body: &dnsmessage.AAAAResource{AAAA: [16]byte(ip)},
 				})
-				for _, ip := range ips {
-					answers = append(answers, dnsmessage.Resource{
-						Header: dnsmessage.ResourceHeader{
-							Name:  q.Name,
-							Type:  dnsmessage.TypeA,
-							Class: dnsmessage.ClassINET,
-							TTL:   120,
-						},
-						Body: &dnsmessage.AResource{A: [4]byte(ip)},
-					})
-				}
-			case dnsmessage.TypeAAAA:
-				ips := lo.FilterMap(ipNets, func(ipNet *net.IPNet, _ int) (net.IP, bool) {
-					ip := ipNet.IP.To16()
-					return ip, ip != nil && ip.To4() == nil
-				})
-				for _, ip := range ips {
-					answers = append(answers, dnsmessage.Resource{
-						Header: dnsmessage.ResourceHeader{
-							Name:  q.Name,
-							Type:  dnsmessage.TypeAAAA,
-							Class: dnsmessage.ClassINET,
-							TTL:   120,
-						},
-						Body: &dnsmessage.AAAAResource{AAAA: [16]byte(ip)},
-					})
-				}
 			}
 		}
+	}
 
-		if len(answers) > 0 {
-			msg.Header.Response = true
-			msg.Header.Authoritative = true
-			msg.Answers = answers
+	if len(answers) > 0 {
+		msg.Header.Response = true
+		msg.Header.Authoritative = true
+		msg.Answers = answers
 
-			buf, err := msg.Pack()
-			if err != nil {
-				panic(err)
-			}
-			if _, err := conn.WriteToUDP(buf, addr); err != nil {
-				panic(err)
-			}
-
-			log.Info().Msgf("Responded to %s on %s", src, iface.Name)
+		buf, err := msg.Pack()
+		if err != nil {
+			panic(err)
+		}
+		if _, err := conn.WriteToUDP(buf, addr); err != nil {
+			panic(err)
 		}
 	}
 }
