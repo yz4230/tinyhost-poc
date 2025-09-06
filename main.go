@@ -117,14 +117,22 @@ func (s *MDNSServer) listen(iface *net.Interface, addr *net.UDPAddr) {
 		}
 
 		s.wg.Go(func() {
-			s.reply(conn, addr, &msg, ipv4Addrs, ipv6Addrs)
-			queries := lo.Map(msg.Questions, func(q dnsmessage.Question, _ int) string { return q.Name.String() })
-			log.Info().Msgf("Replied to %s for %s", src, strings.Join(queries, ", "))
+			if replied := s.reply(conn, addr, &msg, ipv4Addrs, ipv6Addrs); replied {
+				queries := lo.Map(msg.Questions, func(q dnsmessage.Question, _ int) string {
+					return q.Name.String()
+				})
+				log.Info().Msgf("Replied to %s for %s", src, strings.Join(queries, ", "))
+			}
 		})
 	}
 }
 
-func (s *MDNSServer) reply(conn *net.UDPConn, addr *net.UDPAddr, msg *dnsmessage.Message, ipv4Addrs, ipv6Addrs []net.IP) {
+func (s *MDNSServer) reply(
+	conn *net.UDPConn,
+	addr *net.UDPAddr,
+	msg *dnsmessage.Message,
+	ipv4Addrs, ipv6Addrs []net.IP,
+) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -173,7 +181,11 @@ func (s *MDNSServer) reply(conn *net.UDPConn, addr *net.UDPAddr, msg *dnsmessage
 		if _, err := conn.WriteToUDP(buf, addr); err != nil {
 			panic(err)
 		}
+
+		return true
 	}
+
+	return false
 }
 
 func (s *MDNSServer) AddDomain(domain string) {
